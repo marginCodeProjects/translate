@@ -511,6 +511,12 @@ def translate_batch(
             f"{numbered}"
         )
 
+    # Estimate input tokens (~4 chars per token) and set max_tokens
+    # to leave room for the translation (which is ~1.3x the input length).
+    input_chars = len(SYSTEM_PROMPT) + len(user_msg)
+    estimated_input_tokens = input_chars // 3  # conservative estimate
+    max_output = max(1024, min(8192, 16384 - estimated_input_tokens))
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = client.chat.completions.create(
@@ -520,7 +526,7 @@ def translate_batch(
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=temperature,
-                max_tokens=4096,
+                max_tokens=max_output,
             )
             content = resp.choices[0].message.content.strip()
             break
