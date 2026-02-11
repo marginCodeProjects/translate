@@ -25,6 +25,7 @@ import sys
 import time
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -754,6 +755,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to a JSON checkpoint to resume from (skips already-translated paragraphs).",
     )
+    p.add_argument(
+        "--parallel", "-j",
+        type=int,
+        default=4,
+        help="Number of parallel translation requests (default: 4).",
+    )
     return p.parse_args()
 
 
@@ -790,10 +797,12 @@ def translate_all_with_checkpoint(
     batch_size: int,
     temperature: float,
     checkpoint_path: str,
+    parallel: int = 4,
 ) -> list[str]:
     """
     Translate all paragraphs with checkpoint/resume support.
-    Saves progress after each batch so work isn't lost if interrupted.
+    Uses parallel workers to keep the GPU saturated.
+    Saves progress after completed batches so work isn't lost if interrupted.
     """
     # Try loading existing checkpoint
     checkpoint = load_checkpoint(checkpoint_path)
@@ -829,26 +838,60 @@ def translate_all_with_checkpoint(
         print("All paragraphs already translated!")
         return translations  # type: ignore
 
-    # Batch and translate
+    # Split into batches
     batches: list[list[tuple[int, dict]]] = []
     for start in range(0, len(remaining), batch_size):
         batches.append(remaining[start : start + batch_size])
 
     pbar = tqdm(total=len(remaining), desc="Translating", unit="para")
+    completed_since_save = 0
 
-    for batch in batches:
+    def _do_batch(batch: list[tuple[int, dict]]) -> list[tuple[int, str]]:
+        """Translate one batch and return [(index, translated_text), ...]."""
         indices = [idx for idx, _ in batch]
         texts = [p["text"] for _, p in batch]
-
         translated = translate_batch(client, model, texts, temperature)
+        return list(zip(indices, translated))
 
-        for idx, tr in zip(indices, translated):
-            translations[idx] = tr
-            pbar.update(1)
+    # --- Parallel execution ---
+    with ThreadPoolExecutor(max_workers=parallel) as executor:
+        futures = {}
+        batch_iter = iter(enumerate(batches))
 
-        # Save checkpoint after each batch
-        save_checkpoint(paragraphs, translations, checkpoint_path)
+        # Submit initial batch of work
+        for _ in range(min(parallel, len(batches))):
+            bi, batch = next(batch_iter)
+            futures[executor.submit(_do_batch, batch)] = bi
 
+        while futures:
+            # Wait for any future to complete
+            for future in as_completed(futures):
+                bi = futures.pop(future)
+                try:
+                    results = future.result()
+                    for idx, tr in results:
+                        translations[idx] = tr
+                        pbar.update(1)
+                    completed_since_save += len(results)
+                except Exception as e:
+                    print(f"\n[ERROR] Batch {bi} failed: {e}")
+
+                # Save checkpoint periodically (every ~20 paragraphs)
+                if completed_since_save >= 20:
+                    save_checkpoint(paragraphs, translations, checkpoint_path)
+                    completed_since_save = 0
+
+                # Submit next batch if available
+                try:
+                    bi_next, batch_next = next(batch_iter)
+                    futures[executor.submit(_do_batch, batch_next)] = bi_next
+                except StopIteration:
+                    pass
+
+                break  # re-enter as_completed loop
+
+    # Final checkpoint save
+    save_checkpoint(paragraphs, translations, checkpoint_path)
     pbar.close()
     return translations  # type: ignore
 
@@ -892,7 +935,7 @@ def main():
     # 3. Translate
     print(f"\n=== Step 3/4: Translating via {args.model} ===")
     print(f"  API: {args.api_url}")
-    print(f"  Batch size: {args.batch_size}")
+    print(f"  Batch size: {args.batch_size}, Parallel workers: {args.parallel}")
 
     client = OpenAI(
         base_url=args.api_url,
@@ -906,6 +949,7 @@ def main():
         batch_size=args.batch_size,
         temperature=args.temperature,
         checkpoint_path=checkpoint_path,
+        parallel=args.parallel,
     )
 
     # 4. Build PDF
