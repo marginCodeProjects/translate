@@ -251,7 +251,6 @@ def extract_paragraphs(pdf_path: str) -> list[dict]:
                 "page": page_num + 1,
             })
         page_blocks.append(blocks)
-    doc.close()
 
     # --- Detect back-matter start ---
     back_matter_start = total_pages
@@ -366,6 +365,21 @@ def extract_paragraphs(pdf_path: str) -> list[dict]:
     while i < len(flat):
         block = flat[i]
 
+        # Pass through image entries as-is
+        if block.get("kind") == "_image":
+            tagged.append({
+                "kind": "image",
+                "image_path": block["image_path"],
+                "img_width": block["img_width"],
+                "img_height": block["img_height"],
+                "chapter": current_chapter,
+                "page": block["page"],
+                "text": "",
+                "_merge": False,
+            })
+            i += 1
+            continue
+
         # Is this a chapter number block?
         if _is_chapter_number(block["text"]):
             ch_num = int(block["text"])
@@ -374,7 +388,12 @@ def extract_paragraphs(pdf_path: str) -> list[dict]:
 
             # Use the authoritative title from the Table of Contents
             toc_title = toc.get(ch_num, f"Chapter {ch_num}")
-            title_page = flat[i]["page"] if i < len(flat) else block["page"]
+            title_page = block["page"]
+            # Find the next non-image block's page for accurate page info
+            for j in range(i, min(i + 5, len(flat))):
+                if flat[j].get("kind") != "_image":
+                    title_page = flat[j]["page"]
+                    break
 
             tagged.append({
                 "text": toc_title,
@@ -390,6 +409,9 @@ def extract_paragraphs(pdf_path: str) -> list[dict]:
             title_words = set(toc_title.lower().split())
             while i < len(flat):
                 candidate = flat[i]
+                # Don't skip images
+                if candidate.get("kind") == "_image":
+                    break
                 t = candidate["text"]
                 # A block is a title fragment if it's short, single-line,
                 # and its words overlap significantly with the TOC title
@@ -417,7 +439,7 @@ def extract_paragraphs(pdf_path: str) -> list[dict]:
     # merge the next raw block into it. Works both within and across pages.
     merged: list[dict] = []
     for item in tagged:
-        if item["kind"] == "chapter_title":
+        if item["kind"] in ("chapter_title", "image"):
             merged.append(item)
             continue
 
@@ -434,13 +456,8 @@ def extract_paragraphs(pdf_path: str) -> list[dict]:
     # --- Pass 5: classify merged blocks ---
     result: list[dict] = []
     for item in merged:
-        if item["kind"] == "chapter_title":
-            result.append({
-                "text": item["text"],
-                "kind": "chapter_title",
-                "chapter": item["chapter"],
-                "page": item["page"],
-            })
+        if item["kind"] in ("chapter_title", "image"):
+            result.append(item)
             continue
 
         text = item["text"]
@@ -462,6 +479,7 @@ def extract_paragraphs(pdf_path: str) -> list[dict]:
             "page": page,
         })
 
+    doc.close()
     return result
 
 
@@ -637,12 +655,37 @@ def build_pdf(
 
     pdf.add_page()
 
+    usable_w = pdf.w - pdf.l_margin - pdf.r_margin
+
     for para, translation in zip(paragraphs, translations):
+        kind = para.get("kind", "body")
+
+        # --- Image entry ---
+        if kind == "image":
+            img_path = para.get("image_path", "")
+            if img_path and os.path.exists(img_path):
+                # Scale image to fit page width, max 60% of page height
+                iw = para.get("img_width", 200)
+                ih = para.get("img_height", 150)
+                max_h = (pdf.h - pdf.t_margin - pdf.b_margin) * 0.6
+                scale = min(usable_w / iw, max_h / ih, 1.0)
+                draw_w = iw * scale
+                draw_h = ih * scale
+
+                # New page if not enough space
+                if pdf.get_y() + draw_h + 10 > pdf.h - pdf.b_margin:
+                    pdf.add_page()
+
+                # Center image
+                x = pdf.l_margin + (usable_w - draw_w) / 2
+                pdf.image(img_path, x=x, y=pdf.get_y(), w=draw_w, h=draw_h)
+                pdf.set_y(pdf.get_y() + draw_h + 4)
+            continue
+
         # Check if we need a new page (leave at least 40mm)
         if pdf.get_y() > pdf.h - 40:
             pdf.add_page()
 
-        kind = para.get("kind", "body")
         if kind == "chapter_title":
             pdf.chapter_title(para.get("chapter"), para["text"], translation)
         elif kind == "caption":
@@ -760,9 +803,13 @@ def translate_all_with_checkpoint(
     else:
         translations: list[str | None] = [None] * len(paragraphs)
 
-    # Mark short paragraphs as "translated" (keep as-is)
+    # Mark short paragraphs and images as "translated" (keep as-is / skip)
     for i, p in enumerate(paragraphs):
-        if len(p["text"]) < MIN_PARAGRAPH_LEN and translations[i] is None:
+        if translations[i] is not None:
+            continue
+        if p.get("kind") == "image":
+            translations[i] = ""
+        elif len(p["text"]) < MIN_PARAGRAPH_LEN:
             translations[i] = p["text"]
 
     # Collect indices that still need translation
